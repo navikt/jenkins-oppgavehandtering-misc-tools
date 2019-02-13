@@ -1,0 +1,186 @@
+def gitCommit
+def scriptDir="/var/lib/jenkins"
+def repoName="oppgave"
+def repoBranch="master"
+def organization="navikt"
+def appId="23605" // Defined in the GitHub App "oppgavehandtering-ci"
+def checkedOutLibraryScriptsRoot = "./../oppgave-master-pipeline-via-GitHub-App-unstable@libs/"
+//
+// =============================================================================
+// Set when explicitly loading groovy snippets from SCM:
+//
+def dockerUtilsScript
+def naisScript
+def slackScript
+def versionScript
+//
+// =============================================================================
+//
+def checkOutLibrary(final String scriptDir, final String organization, final String repoName, final String repoBranch, final String libraryName, final String appId) {
+	def checkedOutLibraryScriptRoot = 
+		sh (
+		   script      : scriptDir + '/pull-shared-pipeline-scripts-repo-using-GitHub-App.sh \'' + organization + '\' \'' + repoName + '\' \'' + repoBranch + '\' \'' + appId + '\' \'' + libraryName + '\'',
+		   returnStdout: true
+		).trim()
+	return checkedOutLibraryScriptRoot;
+}
+
+def loadLibraryScript(final String checkedOutLibraryScriptRoot, final String libraryScriptName) {
+	return load(checkedOutLibraryScriptRoot + '/vars/' + libraryScriptName + '.groovy')
+}
+//
+// =============================================================================
+//
+pipeline {
+
+    agent any
+	
+	parameters {
+        string(name: 'fasitEnvPreprod', defaultValue: 'q1', description: 'Fasit environment used for reading and exposing resources (preprod)')
+        string(name: 'namespacePreprod', defaultValue: 'default', description: 'Nais namespace (preprod)')
+        booleanParam(name: 'gatling', defaultValue: true, description: 'Whether to run Gatling tests as part of the build')
+        booleanParam(name: 'deployProd', defaultValue: false, description: 'Whether to automatically deploy master branch to prod')
+    }
+
+    environment {
+        APPLICATION_NAME = 'oppgave'
+        APPLICATION_SERVICE = 'gosys'
+        APPLICATION_COMPONENT = 'oppgave'
+        FASIT_ENV = "${params.fasitEnvPreprod}"
+        NAMESPACE = "${params.namespacePreprod}"
+        RUN_GATLING = "${params.gatling}"
+        DEPLOY_TO_PROD = "${params.deployProd}"
+    }
+	
+    tools {
+        maven "maven3"
+        jdk "java8"
+    }
+
+    options {
+        timestamps()
+    }
+
+    stages {
+
+		stage('Pull application from GitHub') {
+            steps {
+                script {
+                   gitCommit = sh (
+					   script      : scriptDir + '/pull-app-repo-using-GitHub-App.sh \'' + organization + '\' \'' + repoName + '\' \'' + repoBranch + '\' \'' + appId + '\'',
+					   returnStdout: true
+                   ).trim()
+				}
+            }
+        }
+        
+		stage('Pull shared pipeline libraries from GitHub') {
+            steps {
+                script {
+					def checkedOutLibraryScriptRoot = checkOutLibrary(scriptDir, organization, 'jenkins-oppgavehandtering-pipeline', 'master', 'pipeline-lib', appId)
+					echo "About to load libraries..."
+					dockerUtilsScript = loadLibraryScript(checkedOutLibraryScriptRoot, 'dockerUtils')
+					naisScript        = loadLibraryScript(checkedOutLibraryScriptRoot, 'nais'       )
+					slackScript       = loadLibraryScript(checkedOutLibraryScriptRoot, 'slack'      )
+					versionScript     = loadLibraryScript(checkedOutLibraryScriptRoot, 'version'    )
+				}
+            }
+        }
+
+        stage('Maven Build') {
+            environment {
+                CURRENT_STAGE       = "${env.STAGE_NAME}"
+				GIT_COMMIT          = "${gitCommit}"
+				APPLICATION_VERSION = versionScript.version(gitCommit)
+            }
+            steps {
+				script {
+                    withCredentials([
+                        usernamePassword([credentialsId: 'junit.sts', usernameVariable: 'junit.sts.user', passwordVariable: 'junit.sts.password']),
+                        usernamePassword([credentialsId: 'oppgave-t0', usernameVariable: 'isso-rp-issuer', passwordVariable: 'OpenIdConnectAgent.password']),
+                        usernamePassword([credentialsId: 'ldap', usernameVariable: 'LDAP_USERNAME', passwordVariable: 'LDAP_PASSWORD']),
+                        string(credentialsId: 'truststore-password', variable: 'truststore.password')
+                    ]) {
+						sh "mvn clean install"
+                    }
+                }
+            }
+        }
+		
+		stage('Build and push docker image') {
+            environment {
+                CURRENT_STAGE       = "${env.STAGE_NAME}"
+				GIT_COMMIT          = "${gitCommit}"
+				APPLICATION_VERSION = versionScript.version(gitCommit)
+            }
+            steps {
+				script {
+					dockerUtilsScript.buildAndPush(env.APPLICATION_NAME, env.APPLICATION_VERSION)
+				}
+            }
+        }
+
+        stage('Validate & upload nais.yaml to nexus') {
+            environment {
+                CURRENT_STAGE       = "${env.STAGE_NAME}"
+				GIT_COMMIT          = "${gitCommit}"
+				APPLICATION_VERSION = versionScript.version(gitCommit)
+            }
+            steps {
+				script {
+					naisScript.validate()
+					naisScript.upload(env.APPLICATION_NAME, env.APPLICATION_VERSION)
+				}
+            }
+        }
+		
+		stage('Deploy to nais preprod') {
+            environment {
+                CURRENT_STAGE       = "${env.STAGE_NAME}"
+				GIT_COMMIT          = "${gitCommit}"
+				APPLICATION_VERSION = versionScript.version(gitCommit)
+            }
+            steps {
+                script {
+                    def deployIssueId = naisScript.jiraDeploy(env.BUILD_URL, env.FASIT_ENV, env.NAMESPACE, env.APPLICATION_NAME, env.APPLICATION_VERSION)
+					echo "deployIssueId: ${deployIssueId}"
+					
+                    echo "About to call naisScript.waitForCallback()..."
+					naisScript.waitForCallback()
+					
+					echo "About to call slackScript.slackBuildDeployed(...)"
+                    slackScript.slackBuildDeployed(deployIssueId, env.APPLICATION_NAME, env.APPLICATION_VERSION, env.FASIT_ENV, env.BUILD_NUMBER, env.BUILD_URL, env.BRANCH_NAME)
+                }
+            }
+        }
+    }
+	
+	post {
+		always {
+			archiveArtifacts artifacts: '**/target/*.jar', allowEmptyArchive: true
+			junit 'target/surefire-reports/*.xml'
+			gatlingArchive()
+
+			script {
+				if (currentBuild.result == 'ABORTED') {
+					echo "Abortion, about to call slackScript.slackBuildAborted(...)"
+					slackScript.slackBuildAborted(env.CURRENT_STAGE, env.BUILD_NUMBER, env.APPLICATION_NAME, env.APPLICATION_VERSION, env.BUILD_URL, env.BRANCH_NAME)
+				}
+				dockerUtilsScript.prune()
+			}
+			deleteDir()
+		}
+		success {
+			script {
+				echo "Success, about to call slackScript.slackBuildSuccess(...)..."
+				slackScript.slackBuildSuccess(env.CURRENT_STAGE, env.BUILD_NUMBER, env.APPLICATION_NAME, env.APPLICATION_VERSION, env.BUILD_URL, env.BRANCH_NAME)
+			}
+		}
+		failure {
+			script {
+				echo "Failure, about to call slackScript.slackBuildFailed(...)..."
+				slackScript.slackBuildFailed(env.CURRENT_STAGE, env.BUILD_NUMBER, env.APPLICATION_NAME, env.APPLICATION_VERSION, env.BUILD_URL, env.BRANCH_NAME)
+			}
+		}
+	}
+}
